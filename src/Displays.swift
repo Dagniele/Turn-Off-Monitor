@@ -2,50 +2,82 @@ import AppKit
 import CoreGraphics
 import Foundation
 
+struct MonitorKey: Hashable, Equatable {
+    var vendorID: UInt32
+    var model: UInt32
+    var serial: UInt32
+
+    var storage: String { "\(vendorID)-\(model)-\(serial)" }
+
+    init(vendorID: UInt32, model: UInt32, serial: UInt32) {
+        self.vendorID = vendorID
+        self.model = model
+        self.serial = serial
+    }
+
+    init?(storage: String) {
+        let parts = storage.split(separator: "-")
+        guard parts.count == 3,
+              let vendorID = UInt32(parts[0]),
+              let model = UInt32(parts[1]),
+              let serial = UInt32(parts[2]) else { return nil }
+        self.vendorID = vendorID
+        self.model = model
+        self.serial = serial
+    }
+}
+
 struct Display {
     let id: CGDirectDisplayID
     let name: String
     let vendor: String
     let vendorID: UInt32
+    let model: UInt32
+    let serial: UInt32
     let width: Int
     let height: Int
     let isActive: Bool
     let isOnline: Bool
     let isMain: Bool
 
-    var isMSI: Bool { vendor == "MSI" }
+    var key: MonitorKey { MonitorKey(vendorID: vendorID, model: model, serial: serial) }
 
     /// Macs keep a vendor-less placeholder in the display list. It is not a monitor.
     var isPlaceholder: Bool { vendorID == 0 && !isOnline && !isActive }
 
     var hasPicture: Bool { width > 1 && height > 1 }
 
+    var label: String { "\(id) \(name)" }
+
     var statusText: String {
         if isActive {
-            var parts = ["acceso"]
-            if isMain { parts.append("principale") }
+            var parts = ["on"]
+            if isMain { parts.append("main") }
             if hasPicture { parts.append("\(width)×\(height)") }
             return parts.joined(separator: " · ")
         }
-        if isMSI { return "spento · non in uso" }
-        return "spento"
+        if Settings.held.contains(key) { return "off · kept off" }
+        return "off"
     }
 }
 
 enum Settings {
-    private static let holdKey = "holdMSIOff"
+    private static let heldKey = "heldMonitors"
 
-    static var holdMSIOff: Bool {
-        get { UserDefaults.standard.bool(forKey: holdKey) }
+    static var held: Set<MonitorKey> {
+        get {
+            let raw = UserDefaults.standard.stringArray(forKey: heldKey) ?? []
+            return Set(raw.compactMap(MonitorKey.init(storage:)))
+        }
         set {
-            UserDefaults.standard.set(newValue, forKey: holdKey)
+            UserDefaults.standard.set(newValue.map(\.storage).sorted(), forKey: heldKey)
             UserDefaults.standard.synchronize()
         }
     }
 }
 
 extension Notification.Name {
-    static let spegniMSIChanged = Notification.Name("com.danielepagano.spegnimsi.changed")
+    static let turnOffMonitorChanged = Notification.Name("com.danielepagano.turnoffmonitor.changed")
 }
 
 enum Displays {
@@ -57,11 +89,137 @@ enum Displays {
         }
     }
 
-    static func msiDisplays() -> [Display] {
-        all().filter(\.isMSI)
+    static func resolve(_ query: String) throws -> Display {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if q.isEmpty { throw DisplayOffError.noMatch(query) }
+        let displays = visible()
+
+        if q.allSatisfy(\.isNumber), let id = UInt32(q), let display = displays.first(where: { $0.id == id }) {
+            return display
+        }
+
+        let needle = q.lowercased()
+        let exactName = displays.filter { $0.name.lowercased() == needle }
+        if exactName.count == 1 { return exactName[0] }
+        if exactName.count > 1 { throw DisplayOffError.ambiguous(q, exactName.map(\.label)) }
+
+        let exactVendor = displays.filter { $0.vendor.lowercased() == needle }
+        if exactVendor.count == 1 { return exactVendor[0] }
+        if exactVendor.count > 1 { throw DisplayOffError.ambiguous(q, exactVendor.map(\.label)) }
+
+        let contains = displays.filter { $0.name.lowercased().contains(needle) }
+        if contains.count == 1 { return contains[0] }
+        if contains.isEmpty { throw DisplayOffError.noMatch(q) }
+        throw DisplayOffError.ambiguous(q, contains.map(\.label))
     }
 
-    static func all() -> [Display] {
+    /// Removes the monitor from the desktop and remembers it, so a later reconnect is turned off too.
+    @discardableResult
+    static func turnOff(_ query: String) throws -> Display {
+        let display = try resolve(query)
+        return try turnOff(display)
+    }
+
+    @discardableResult
+    static func turnOff(key storage: String) throws -> Display {
+        guard let display = find(storage) else { throw DisplayOffError.noMatch(storage) }
+        return try turnOff(display)
+    }
+
+    /// Stops keeping this monitor off. Brings it back only when it still has a signal.
+    static func turnOn(_ query: String) throws -> String {
+        try turnOn(try resolve(query))
+    }
+
+    static func turnOn(key storage: String) throws -> String {
+        guard let display = find(storage) else { throw DisplayOffError.noMatch(storage) }
+        return try turnOn(display)
+    }
+
+    static func releaseHold(key storage: String) {
+        guard let key = MonitorKey(storage: storage) else { return }
+        var held = Settings.held
+        held.remove(key)
+        Settings.held = held
+        notifyChanged()
+    }
+
+    static func isHeld(key storage: String) -> Bool {
+        guard let key = MonitorKey(storage: storage) else { return false }
+        return Settings.held.contains(key)
+    }
+
+    /// Turning a monitor off is safe when another monitor would still be on.
+    static func canTurnOff(_ display: Display) -> Bool {
+        if !display.isActive { return true }
+        return all().filter(\.isActive).count > 1
+    }
+
+    static func reapplyHold() {
+        let held = Settings.held
+        guard !held.isEmpty else { return }
+        for display in all() where held.contains(display.key) && display.isActive {
+            try? disable(display)
+        }
+    }
+
+    static func heldNames() -> [String] {
+        let displays = visible()
+        return Settings.held.compactMap { key in
+            displays.first { $0.key == key }?.name
+        }.sorted()
+    }
+
+    static func notifyChanged() {
+        DistributedNotificationCenter.default().postNotificationName(
+            .turnOffMonitorChanged,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    private static func turnOff(_ display: Display) throws -> Display {
+        try disable(display)
+        var held = Settings.held
+        held.insert(display.key)
+        Settings.held = held
+        notifyChanged()
+        return display
+    }
+
+    private static func turnOn(_ display: Display) throws -> String {
+        var held = Settings.held
+        held.remove(display.key)
+        Settings.held = held
+        notifyChanged()
+
+        if display.isActive {
+            return "\(display.name) is already on."
+        }
+        // A panel with no link is 1×1 and offline. Forcing it on would give
+        // macOS a desktop you cannot see. Clearing the hold is enough.
+        if !display.isOnline && !display.hasPicture {
+            return "\(display.name) has no signal. It stays available when its input is on this Mac."
+        }
+        try SkyLight.setEnabled(display.id, true)
+        return "\(display.name) turned on."
+    }
+
+    private static func disable(_ display: Display) throws {
+        guard display.isActive else { return }
+        if all().filter(\.isActive).count <= 1 {
+            throw DisplayOffError.lastDisplay
+        }
+        try SkyLight.setEnabled(display.id, false)
+    }
+
+    private static func find(_ storage: String) -> Display? {
+        guard let key = MonitorKey(storage: storage) else { return nil }
+        return all().first { $0.key == key }
+    }
+
+    private static func all() -> [Display] {
         guard let getList = SkyLight.getDisplayList() else { return onlineFallback() }
 
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
@@ -70,101 +228,8 @@ enum Displays {
 
         let screens = screenNames()
         return ids.prefix(Int(count)).map { id in
-            let vendorID = CGDisplayVendorNumber(id)
-            let vendor = vendorCode(vendorID)
-            let width = Int(CGDisplayPixelsWide(id))
-            let height = Int(CGDisplayPixelsHigh(id))
-            let product = productName(id)
-            let name = screens[id] ?? product ?? (vendor == "MSI" ? "MSI" : "Monitor \(id)")
-            return Display(
-                id: id,
-                name: name,
-                vendor: vendor,
-                vendorID: vendorID,
-                width: width,
-                height: height,
-                isActive: CGDisplayIsActive(id) != 0,
-                isOnline: CGDisplayIsOnline(id) != 0,
-                isMain: CGDisplayIsMain(id) != 0
-            )
+            makeDisplay(id, screens: screens, online: CGDisplayIsOnline(id) != 0)
         }
-    }
-
-    /// Turns every active MSI off and keeps it off if it reconnects.
-    /// Refuses if that would leave the Mac with no picture.
-    @discardableResult
-    static func turnMSIOff() throws -> Int {
-        let turnedOff = try disableActiveMSI()
-        Settings.holdMSIOff = true
-        notifyChanged()
-        return turnedOff
-    }
-
-    /// Stops forcing the MSI off, then tries to bring it back onto the desktop.
-    /// A monitor whose input is on the other Mac has no signal: clearing the hold
-    /// is still the useful part, because the panel comes back on its own later.
-    @discardableResult
-    static func turnMSIOn() -> [String] {
-        Settings.holdMSIOff = false
-        notifyChanged()
-
-        let msis = msiDisplays()
-        if msis.isEmpty {
-            return ["Nessun monitor MSI trovato. Non lo terrò spento."]
-        }
-
-        var notes: [String] = []
-        for display in msis where !display.isActive {
-            // A panel with no link is 1×1 and offline. Forcing it on would
-            // give macOS a desktop you cannot see. Clearing the hold is enough:
-            // the monitor joins the desktop on its own when its input comes back.
-            if !display.isOnline && !display.hasPicture {
-                notes.append("\(display.name) non ha segnale. Appena l'ingresso torna su questo Mac resta acceso.")
-                continue
-            }
-            do {
-                try SkyLight.setEnabled(display.id, true)
-                notes.append("\(display.name) acceso.")
-            } catch {
-                notes.append("Non riesco a riaccendere \(display.name): \(error)")
-            }
-        }
-        if notes.isEmpty {
-            notes.append("MSI già acceso. Non lo spengo più da solo.")
-        }
-        return notes
-    }
-
-    /// If the user asked to keep the MSI off and it came back (input switch, wake),
-    /// remove it from the desktop again. Does not rewrite preferences.
-    static func reapplyHold() {
-        guard Settings.holdMSIOff else { return }
-        _ = try? disableActiveMSI()
-    }
-
-    private static func disableActiveMSI() throws -> Int {
-        let displays = all()
-        let activeMSI = displays.filter { $0.isMSI && $0.isActive }
-        if activeMSI.isEmpty { return 0 }
-
-        let activeCount = displays.filter(\.isActive).count
-        if activeCount - activeMSI.count < 1 {
-            throw DisplayOffError.lastDisplay
-        }
-
-        for display in activeMSI {
-            try SkyLight.setEnabled(display.id, false)
-        }
-        return activeMSI.count
-    }
-
-    static func notifyChanged() {
-        DistributedNotificationCenter.default().postNotificationName(
-            .spegniMSIChanged,
-            object: nil,
-            userInfo: nil,
-            deliverImmediately: true
-        )
     }
 
     private static func onlineFallback() -> [Display] {
@@ -174,20 +239,29 @@ enum Displays {
         guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
         let screens = screenNames()
         return ids.prefix(Int(count)).map { id in
-            let vendorID = CGDisplayVendorNumber(id)
-            let vendor = vendorCode(vendorID)
-            return Display(
-                id: id,
-                name: screens[id] ?? (vendor == "MSI" ? "MSI" : "Monitor \(id)"),
-                vendor: vendor,
-                vendorID: vendorID,
-                width: Int(CGDisplayPixelsWide(id)),
-                height: Int(CGDisplayPixelsHigh(id)),
-                isActive: CGDisplayIsActive(id) != 0,
-                isOnline: true,
-                isMain: CGDisplayIsMain(id) != 0
-            )
+            makeDisplay(id, screens: screens, online: true)
         }
+    }
+
+    private static func makeDisplay(_ id: CGDirectDisplayID, screens: [CGDirectDisplayID: String], online: Bool) -> Display {
+        let vendorID = CGDisplayVendorNumber(id)
+        let vendor = vendorCode(vendorID)
+        let product = productName(id)
+        let fallback = vendor.isEmpty ? "Monitor \(id)" : vendor
+        let name = screens[id] ?? product ?? fallback
+        return Display(
+            id: id,
+            name: name,
+            vendor: vendor,
+            vendorID: vendorID,
+            model: CGDisplayModelNumber(id),
+            serial: CGDisplaySerialNumber(id),
+            width: Int(CGDisplayPixelsWide(id)),
+            height: Int(CGDisplayPixelsHigh(id)),
+            isActive: CGDisplayIsActive(id) != 0,
+            isOnline: online,
+            isMain: CGDisplayIsMain(id) != 0
+        )
     }
 
     private static func screenNames() -> [CGDirectDisplayID: String] {
@@ -205,7 +279,7 @@ enum Displays {
         guard let copy = SkyLight.copyDisplayInfo(), let pointer = copy(id) else { return nil }
         let info = Unmanaged<CFDictionary>.fromOpaque(pointer).takeRetainedValue() as NSDictionary
         guard let names = info["DisplayProductName"] as? NSDictionary else { return nil }
-        let order = [Locale.current.identifier, "it_IT", "en_US", "en_GB"]
+        let order = [Locale.current.identifier, "en_US", "en_GB", "it_IT"]
         for key in order {
             if let name = names[key] as? String {
                 let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -220,7 +294,7 @@ enum Displays {
         return nil
     }
 
-    /// EDID manufacturer id is three letters packed into 16 bits. MSI is 13929, Samsung is 19501.
+    /// EDID manufacturer id is three letters packed into 16 bits.
     private static func vendorCode(_ vendorID: UInt32) -> String {
         func letter(_ value: UInt32) -> Character? {
             let index = value & 0x1F

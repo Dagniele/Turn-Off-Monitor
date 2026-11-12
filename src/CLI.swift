@@ -2,53 +2,57 @@ import Foundation
 
 enum CLI {
     static func run(_ arguments: [String]) -> Never {
-        let command = arguments.first?.lowercased() ?? "help"
+        guard let first = arguments.first else {
+            help()
+            exit(0)
+        }
+        let command = first.lowercased()
         switch command {
         case "list", "status", "ls":
             list()
             exit(0)
         case "off", "spegni":
-            spegni()
+            turnOff(arguments.dropFirst().joined(separator: " "))
         case "on", "accendi":
-            accendi()
+            turnOn(arguments.dropFirst().joined(separator: " "))
         case "help", "-h", "--help":
             help()
             exit(0)
         default:
-            fputs("Comando sconosciuto: \(command)\n\n", stderr)
-            help()
-            exit(1)
+            turnOff(arguments.joined(separator: " "))
         }
     }
 
     private static func list() {
         let displays = Displays.visible()
         if displays.isEmpty {
-            print("Nessun monitor trovato.")
+            print("No monitors found.")
             return
         }
         for display in displays {
-            let mark = display.isMSI ? "  ← condiviso" : ""
-            print("\(display.id)\t\(display.name)\t\(display.statusText)\(mark)")
+            let vendor = display.vendor.isEmpty ? "" : "\t\(display.vendor)"
+            print("\(display.id)\t\(display.name)\t\(display.statusText)\(vendor)")
         }
-        if Settings.holdMSIOff {
-            print("\nTengo l'MSI spento se ricompare.")
+        let held = Displays.heldNames()
+        if held.isEmpty {
+            print("\nNo monitor is kept off.")
         } else {
-            print("\nL'MSI può accendersi quando l'ingresso torna su questo Mac.")
+            print("\nKept off: \(held.joined(separator: ", "))")
         }
     }
 
-    private static func spegni() -> Never {
+    private static func turnOff(_ query: String) -> Never {
+        guard !query.isEmpty else {
+            fputs("Pass the monitor to turn off (name, vendor or id).\n\n", stderr)
+            list()
+            exit(1)
+        }
         do {
-            let turnedOff = try Displays.turnMSIOff()
-            if turnedOff == 0 {
-                if Displays.msiDisplays().isEmpty {
-                    print("Nessun monitor MSI trovato. Se lo colleghi, lo tengo spento.")
-                } else {
-                    print("MSI già spento. Lo tengo spento se ricompare.")
-                }
+            let display = try Displays.turnOff(query)
+            if display.isActive {
+                print("\(display.name) turned off.")
             } else {
-                print("MSI spento. Le finestre restano sull'altro monitor.")
+                print("\(display.name) is already off. I'll turn it off again if it comes back.")
             }
             exit(0)
         } catch {
@@ -57,34 +61,39 @@ enum CLI {
         }
     }
 
-    private static func accendi() -> Never {
-        if Displays.msiDisplays().isEmpty {
-            Settings.holdMSIOff = false
-            Displays.notifyChanged()
-            print("Nessun monitor MSI trovato. Non lo terrò spento.")
+    private static func turnOn(_ query: String) -> Never {
+        guard !query.isEmpty else {
+            fputs("Pass the monitor to turn on (name, vendor or id).\n\n", stderr)
+            list()
+            exit(1)
+        }
+        do {
+            print(try Displays.turnOn(query))
             exit(0)
+        } catch {
+            fputs("\(error)\n", stderr)
+            exit(1)
         }
-        for note in Displays.turnMSIOn() {
-            print(note)
-        }
-        exit(0)
     }
 
     private static func help() {
-        let text = """
-        Uso:
-          spegnimsi list      mostra i monitor
-          spegnimsi off       stacca l'MSI da questo Mac
-          spegnimsi on        riattacca l'MSI
+        print("""
+        Usage:
+          turnoffmonitor list
+          turnoffmonitor off <monitor>
+          turnoffmonitor on <monitor>
+          turnoffmonitor <monitor>
 
-        off toglie l'MSI dal desktop (le finestre tornano sul Samsung) e,
-        finché l'app è aperta, lo stacca di nuovo se ricompare.
-        on va usato quando l'ingresso del monitor è su questo Mac.
+        <monitor> is a name, a vendor (MSI, SAM, …) or the id from list.
+        A bare name turns that monitor off.
 
-        Senza argomenti apre l'icona nella barra dei menu.
-        Lo spegnimento dura fino al logout.
+        off removes it from the desktop. While this app is open, it is turned
+        off again if it comes back. on brings it back — only when that
+        monitor's input is on this Mac.
 
-        """
-        print(text)
+        With no arguments, opens the menu bar icon.
+        Turning a monitor off lasts until you log out.
+
+        """)
     }
 }

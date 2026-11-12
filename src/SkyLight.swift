@@ -64,18 +64,25 @@ enum DisplayOffError: Error, LocalizedError, CustomStringConvertible {
     case rejected(String, CGError)
     case lastDisplay
 
-    var description: String { errorDescription ?? "Errore sconosciuto." }
+    case noMatch(String)
+    case ambiguous(String, [String])
+
+    var description: String { errorDescription ?? "Unknown error." }
 
     var errorDescription: String? {
         switch self {
         case let .symbolMissing(name):
-            return "\(name) non è più disponibile. Un aggiornamento di macOS può aver spostato l'API."
+            return "\(name) is no longer available. A macOS update may have moved this API."
         case let .failed(call):
-            return "\(call) non è riuscita."
+            return "\(call) failed."
         case let .rejected(call, error):
-            return "\(call) ha restituito l'errore \(error.rawValue)."
+            return "\(call) returned error \(error.rawValue)."
         case .lastDisplay:
-            return "Non spengo l'unico monitor acceso."
+            return "Refusing to turn off the only monitor that is still on."
+        case let .noMatch(query):
+            return "No monitor matches '\(query)'. Run list to see names, vendors and ids."
+        case let .ambiguous(query, names):
+            return "'\(query)' matches more than one monitor: \(names.joined(separator: ", ")). Pass the id from list."
         }
     }
 }
