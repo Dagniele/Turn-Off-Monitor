@@ -156,6 +156,9 @@ enum Displays {
     }
 
     static func reapplyHold() {
+        // The menu bar app and the command line are different processes.
+        // Reload preferences before acting, or a just-requested "on" is undone.
+        UserDefaults.standard.synchronize()
         let held = Settings.held
         guard !held.isEmpty else { return }
         for display in all() where held.contains(display.key) && display.isActive {
@@ -197,13 +200,27 @@ enum Displays {
         if display.isActive {
             return "\(display.name) is already on."
         }
-        // A panel with no link is 1×1 and offline. Forcing it on would give
-        // macOS a desktop you cannot see. Clearing the hold is enough.
-        if !display.isOnline && !display.hasPicture {
-            return "\(display.name) has no signal. It stays available when its input is on this Mac."
+
+        // A monitor turned off with this app stays in the list as 1×1 and
+        // offline. That is the disabled state, not a reason to skip the call.
+        do {
+            try SkyLight.setEnabled(display.id, true)
+        } catch {
+            throw DisplayOffError.failed(onFailure(display, error))
         }
-        try SkyLight.setEnabled(display.id, true)
-        return "\(display.name) turned on."
+
+        if all().first(where: { $0.key == display.key })?.isActive == true {
+            return "\(display.name) turned on."
+        }
+        throw DisplayOffError.failed(onFailure(display, nil))
+    }
+
+    private static func onFailure(_ display: Display, _ error: Error?) -> String {
+        let detail = error.map { " \($0.localizedDescription)" } ?? ""
+        if !display.isOnline && !display.hasPicture {
+            return "\(display.name) did not turn on.\(detail) Switch its input to this Mac, then try again."
+        }
+        return "\(display.name) did not turn on.\(detail)"
     }
 
     private static func disable(_ display: Display) throws {
